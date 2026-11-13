@@ -1,0 +1,1602 @@
+/* ListenTo Studio v2.0 — Interactive Bilingual Subtitle Workbench */
+
+(() => {
+  "use strict";
+
+  const state = {
+    meta: null,
+    settings: null,
+    doc: null,
+    activeCueId: null,
+    filter: "all",
+    searchQuery: "",
+    searchScope: "target",
+    previewSubview: "bilingual",
+    undoStack: [],
+    redoStack: [],
+    translating: false,
+    abortController: null,
+    openPopoverCueId: null,
+    cueSuggestions: {}, // cue_id -> { best, alternatives, reason }
+    simPlaying: false,
+    simTimeMs: 0,
+    simLastTick: 0,
+    simRaf: null,
+    hasMediaFile: false,
+    saveTimer: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  // Format ms -> HH:MM:SS.mmm
+  function msToDisplay(ms) {
+    const v = Math.max(0, Math.round(ms || 0));
+    const h = Math.floor(v / 3600000);
+    const m = Math.floor((v % 3600000) / 60000);
+    const s = Math.floor((v % 60000) / 1000);
+    const f = v % 1000;
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}`;
+  }
+
+  function parseDisplayToMs(str) {
+    const cleaned = String(str || "").trim().replace(",", ".");
+    const parts = cleaned.split(":");
+    if (parts.length < 2 || parts.length > 3) return null;
+    let h = 0, m = 0, secPart = "0";
+    if (parts.length === 2) {
+      m = parseInt(parts[0], 10);
+      secPart = parts[1];
+    } else {
+      h = parseInt(parts[0], 10);
+      m = parseInt(parts[1], 10);
+      secPart = parts[2];
+    }
+    const [sStr, fStr = "0"] = secPart.split(".");
+    const s = parseInt(sStr, 10);
+    const f = parseInt((fStr + "000").slice(0, 3), 10);
+    if ([h, m, s, f].some((n) => Number.isNaN(n) || n < 0)) return null;
+    return (h * 3600 + m * 60 + s) * 1000 + f;
+  }
+
+  function computeCps(cue) {
+    if (!cue || cue.is_special) return 0;
+    const text = (cue.target_text || cue.source_text || "").replace(/\s+/g, "");
+    if (!text) return 0;
+    const durSec = Math.max(0.4, (cue.end_ms - cue.start_ms) / 1000);
+    return text.length / durSec;
+  }
+
+  function isCueLongWarning(cue) {
+    if (!cue || cue.is_special) return false;
+    const txt = (cue.target_text || "").trim();
+    if (!txt) return false;
+    const cps = computeCps(cue);
+    const maxLine = Math.max(...txt.split("\n").map((l) => l.trim().length));
+    return cps > 16 || maxLine > 34;
+  }
+
+  function toast(msg, type = "info") {
+    const stack = $("toast-stack");
+    const el = document.createElement("div");
+    el.className = `toast ${type}`;
+    el.textContent = msg;
+    stack.appendChild(el);
+    setTimeout(() => {
+      el.style.opacity = "0";
+      setTimeout(() => el.remove(), 220);
+    }, 3600);
+  }
+
+  function pushUndoSnapshot() {
+    if (!state.doc) return;
+    const snap = JSON.stringify({
+      cues: state.doc.cues,
+      glossary: state.doc.glossary,
+      scene_summary: state.doc.scene_summary,
+    });
+    if (state.undoStack.length && state.undoStack[state.undoStack.length - 1] === snap) {
+      return;
+    }
+    state.undoStack.push(snap);
+    if (state.undoStack.length > 40) state.undoStack.shift();
+    state.redoStack = [];
+    refreshUndoButtons();
+  }
+
+  function undo() {
+    if (!state.doc || !state.undoStack.length) return;
+    state.redoStack.push(
+      JSON.stringify({
+        cues: state.doc.cues,
+        glossary: state.doc.glossary,
+        scene_summary: state.doc.scene_summary,
+      })
+    );
+    const prev = JSON.parse(state.undoStack.pop());
+    state.doc.cues = prev.cues;
+    state.doc.glossary = prev.glossary;
+    state.doc.scene_summary = prev.scene_summary;
+    refreshUndoButtons();
+    renderAll();
+    scheduleAutoSave();
+  }
+
+  function redo() {
+    if (!state.doc || !state.redoStack.length) return;
+    state.undoStack.push(
+      JSON.stringify({
+        cues: state.doc.cues,
+        glossary: state.doc.glossary,
+        scene_summary: state.doc.scene_summary,
+      })
+    );
+    const next = JSON.parse(state.redoStack.pop());
+    state.doc.cues = next.cues;
+    state.doc.glossary = next.glossary;
+    state.doc.scene_summary = next.scene_summary;
+    refreshUndoButtons();
+    renderAll();
+    scheduleAutoSave();
+  }
+
+  function refreshUndoButtons() {
+    $("btn-undo").disabled = state.undoStack.length === 0;
+    $("btn-redo").disabled = state.redoStack.length === 0;
+  }
+
+  function scheduleAutoSave() {
+    if (!state.doc) return;
+    $("doc-save-state").textContent = "保存中…";
+    try {
+      localStorage.setItem("listento_studio_last_doc", JSON.stringify(state.doc));
+    } catch (_) {}
+    clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(async () => {
+      try {
+        await fetch("/api/projects/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state.doc),
+        });
+        $("doc-save-state").textContent = "已自动保存";
+      } catch (_) {
+        $("doc-save-state").textContent = "本地已缓存";
+      }
+    }, 700);
+  }
+
+  // Initialization
+  async function init() {
+    const savedTheme = localStorage.getItem("listento_theme") || "dark";
+    document.documentElement.setAttribute("data-theme", savedTheme);
+
+    bindEvents();
+
+    try {
+      const resp = await fetch("/api/meta");
+      const meta = await resp.json();
+      state.meta = meta;
+      state.settings = meta.settings;
+      populateLanguageSelectors(meta.languages);
+      populateSampleMenus(meta.samples);
+      populateProviderPresets(meta.presets);
+      refreshApiStatusUI();
+    } catch (err) {
+      toast("无法连接本地后端服务，请检查服务是否已启动。", "error");
+    }
+
+    // Restore cached session if available
+    try {
+      const cached = localStorage.getItem("listento_studio_last_doc");
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.cues) && parsed.cues.length > 0) {
+          loadDocumentIntoStudio(parsed, false);
+        }
+      }
+    } catch (_) {}
+  }
+
+  function populateLanguageSelectors(languages) {
+    const srcSel = $("select-source-lang");
+    const tgtSel = $("select-target-lang");
+    srcSel.innerHTML = "";
+    tgtSel.innerHTML = "";
+    for (const lang of languages) {
+      const opt1 = document.createElement("option");
+      opt1.value = lang.code;
+      opt1.textContent = `原: ${lang.label.split(" ")[0]}`;
+      srcSel.appendChild(opt1);
+
+      if (lang.code !== "auto") {
+        const opt2 = document.createElement("option");
+        opt2.value = lang.code;
+        opt2.textContent = `译: ${lang.label.split(" ")[0]}`;
+        tgtSel.appendChild(opt2);
+      }
+    }
+    srcSel.value = "auto";
+    tgtSel.value = state.settings?.default_target_lang || "zh";
+  }
+
+  function populateSampleMenus(samples) {
+    const menu = $("sample-menu");
+    const cards = $("welcome-sample-cards");
+    menu.innerHTML = "";
+    cards.innerHTML = "";
+
+    for (const s of samples) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "dropdown-item";
+      btn.innerHTML = `
+        <div class="dropdown-item-top">
+          <span>${escapeHtml(s.title)}</span>
+          <span class="doc-tag">${escapeHtml(s.badge)}</span>
+        </div>
+        <div class="dropdown-item-desc">${escapeHtml(s.desc)}</div>
+      `;
+      btn.addEventListener("click", () => {
+        menu.hidden = true;
+        loadSampleById(s.id);
+      });
+      menu.appendChild(btn);
+
+      const card = document.createElement("div");
+      card.className = "sample-card";
+      card.innerHTML = `
+        <span class="sample-card-badge">${escapeHtml(s.badge)}</span>
+        <div class="sample-card-title">${escapeHtml(s.title)}</div>
+        <div class="sample-card-desc">${escapeHtml(s.desc)}</div>
+      `;
+      card.addEventListener("click", () => loadSampleById(s.id));
+      cards.appendChild(card);
+    }
+  }
+
+  function populateProviderPresets(presets) {
+    const grid = $("provider-grid");
+    grid.innerHTML = "";
+    for (const p of presets) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "provider-btn";
+      btn.dataset.providerId = p.id;
+      btn.innerHTML = `
+        <div class="provider-btn-name">${escapeHtml(p.name)}</div>
+        <div class="provider-btn-badge">${escapeHtml(p.badge)}</div>
+      `;
+      btn.addEventListener("click", () => selectProviderPreset(p.id, true));
+      grid.appendChild(btn);
+    }
+  }
+
+  function selectProviderPreset(providerId, overwriteFields = false) {
+    const presets = state.meta?.presets || [];
+    const preset = presets.find((p) => p.id === providerId) || presets[0];
+    if (!preset) return;
+
+    document.querySelectorAll(".provider-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.providerId === preset.id);
+    });
+    $("provider-hint").textContent = preset.doc_hint || "";
+
+    const datalist = $("cfg-model-datalist");
+    datalist.innerHTML = "";
+    for (const m of preset.models || []) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      datalist.appendChild(opt);
+    }
+
+    if (overwriteFields) {
+      $("cfg-base-url").value = preset.base_url;
+      $("cfg-model").value = preset.default_model;
+    }
+    gridCurrentProvider = preset.id;
+  }
+  let gridCurrentProvider = "deepseek";
+
+  function refreshApiStatusUI() {
+    if (!state.settings) return;
+    const btn = $("btn-open-settings");
+    const label = $("api-status-label");
+    const isLocal = (state.settings.base_url || "").includes("localhost") || (state.settings.base_url || "").includes("127.0.0.1");
+    const ready = state.settings.has_api_key || isLocal;
+
+    btn.classList.toggle("ready", ready);
+    label.textContent = ready ? `${state.settings.model}` : "配置 API Key";
+    $("select-trans-mode").value = state.settings.default_mode || "reflective";
+  }
+
+  async function loadSampleById(sampleId) {
+    try {
+      const resp = await fetch(`/api/samples/${encodeURIComponent(sampleId)}`);
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || "加载示例失败");
+      }
+      const doc = await resp.json();
+      loadDocumentIntoStudio(doc, true);
+      toast(`已载入示例：${doc.filename}`, "success");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  async function uploadSubtitleFile(file) {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("encoding", "auto");
+    try {
+      const resp = await fetch("/api/subtitles/parse", { method: "POST", body: form });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "字幕解析失败");
+      loadDocumentIntoStudio(data, true);
+      toast(`成功载入 ${data.filename}（共 ${data.cues.length} 条）`, "success");
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  function mountMediaFile(file) {
+    const video = $("media-player");
+    const url = URL.createObjectURL(file);
+    stopSimPlayback();
+    state.hasMediaFile = true;
+    video.src = url;
+    video.hidden = false;
+    $("stage-placeholder").hidden = true;
+    toast(`已挂载本地媒体：${file.name}`, "success");
+  }
+
+  function loadDocumentIntoStudio(doc, resetHistory = true) {
+    state.doc = doc;
+    state.cueSuggestions = {};
+    if (resetHistory) {
+      state.undoStack = [];
+      state.redoStack = [];
+      refreshUndoButtons();
+    }
+
+    $("welcome-state").hidden = true;
+    $("cue-table-wrap").hidden = false;
+    $("doc-meta-pill").hidden = false;
+    $("doc-filename").textContent = doc.filename;
+    $("doc-format-badge").textContent = (doc.source_format || "srt").toUpperCase();
+    $("doc-save-state").textContent = "已就绪";
+
+    $("select-source-lang").value = doc.source_language || "auto";
+    $("select-target-lang").value = doc.target_language || "zh";
+    $("select-genre").value = doc.genre || "general";
+    $("scene-summary-input").value = doc.scene_summary || "";
+    $("custom-prompt-input").value = doc.custom_prompt || "";
+
+    const hasDoc = true;
+    $("btn-open-export").disabled = !hasDoc;
+    $("btn-translate-all").disabled = !hasDoc;
+    $("btn-translate-untranslated").disabled = !hasDoc;
+    $("btn-split-bilingual").disabled = !hasDoc;
+    $("btn-time-shift").disabled = !hasDoc;
+    $("btn-toggle-search").disabled = !hasDoc;
+    $("btn-extract-glossary").disabled = !hasDoc;
+
+    const firstDialogue = doc.cues.find((c) => !c.is_special) || doc.cues[0];
+    state.activeCueId = firstDialogue ? firstDialogue.id : null;
+    state.simTimeMs = firstDialogue ? firstDialogue.start_ms : 0;
+
+    renderWarnings();
+    renderAll();
+    if (firstDialogue) updateStageOverlayForCue(firstDialogue);
+    scheduleAutoSave();
+  }
+
+  function renderWarnings() {
+    const strip = $("warnings-strip");
+    const warnings = state.doc?.warnings || [];
+    if (!warnings.length) {
+      strip.hidden = true;
+      return;
+    }
+    strip.hidden = false;
+    strip.innerHTML = `
+      <span>💡 ${escapeHtml(warnings.join(" ｜ "))}</span>
+      <button class="btn btn-icon btn-sm" id="btn-dismiss-warn" type="button">✕</button>
+    `;
+    $("btn-dismiss-warn").onclick = () => {
+      state.doc.warnings = [];
+      strip.hidden = true;
+    };
+  }
+
+  function renderAll() {
+    if (!state.doc) return;
+    updateCounts();
+    renderGlossary();
+    renderCueList();
+  }
+
+  function updateCounts() {
+    const cues = (state.doc?.cues || []).filter((c) => !c.is_special);
+    const translated = cues.filter((c) => (c.target_text || "").trim().length > 0).length;
+    const untranslated = cues.length - translated;
+    const longWarn = cues.filter((c) => isCueLongWarning(c)).length;
+
+    $("count-all").textContent = cues.length;
+    $("count-untranslated").textContent = untranslated;
+    $("count-translated").textContent = translated;
+    $("count-long").textContent = longWarn;
+  }
+
+  function renderGlossary() {
+    const list = $("glossary-list");
+    const glossary = state.doc?.glossary || [];
+    $("glossary-count").textContent = glossary.length;
+
+    if (!glossary.length) {
+      list.innerHTML = `<div class="empty-mini">添加专有名词或人名后，AI 全文精翻与单句润色将严格统一译法。</div>`;
+      return;
+    }
+
+    list.innerHTML = "";
+    glossary.forEach((item, idx) => {
+      const row = document.createElement("div");
+      row.className = "glossary-item";
+      row.innerHTML = `
+        <div class="glossary-pair" title="${escapeHtml(item.note || "")}">
+          <input type="checkbox" ${item.enabled !== false ? "checked" : ""} data-g-toggle="${idx}" />
+          <span class="glossary-src">${escapeHtml(item.source)}</span>
+          <span class="lang-arrow">→</span>
+          <span class="glossary-tgt">${escapeHtml(item.target)}</span>
+        </div>
+        <button class="btn btn-icon btn-sm" data-g-del="${idx}" type="button" title="删除">✕</button>
+      `;
+      list.appendChild(row);
+    });
+  }
+
+  function getFilteredCues() {
+    if (!state.doc) return [];
+    const q = state.searchQuery.trim().toLowerCase();
+    let matchCount = 0;
+
+    const filtered = state.doc.cues.filter((cue) => {
+      if (state.filter === "untranslated") {
+        if (cue.is_special || (cue.target_text || "").trim()) return false;
+      } else if (state.filter === "translated") {
+        if (cue.is_special || !(cue.target_text || "").trim()) return false;
+      } else if (state.filter === "long") {
+        if (!isCueLongWarning(cue)) return false;
+      }
+
+      if (q) {
+        const inSrc = (cue.source_text || "").toLowerCase().includes(q);
+        const inTgt = (cue.target_text || "").toLowerCase().includes(q);
+        const matched =
+          state.searchScope === "source" ? inSrc : state.searchScope === "target" ? inTgt : inSrc || inTgt;
+        if (matched) matchCount++;
+        return matched;
+      }
+      return true;
+    });
+
+    if ($("search-bar") && !$("search-bar").hidden) {
+      $("search-match-count").textContent = q ? `匹配 ${matchCount} 条` : "";
+    }
+    return filtered;
+  }
+
+  function autoResizeTextarea(el) {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.max(38, el.scrollHeight)}px`;
+  }
+
+  function renderCueList() {
+    const container = $("cue-list");
+    const cues = getFilteredCues();
+    container.innerHTML = "";
+
+    const frag = document.createDocumentFragment();
+    cues.forEach((cue) => {
+      const row = document.createElement("div");
+      row.className = `cue-row${cue.id === state.activeCueId ? " active" : ""}${cue.is_special ? " special-row" : ""}`;
+      row.dataset.cueId = cue.id;
+
+      const durSec = ((cue.end_ms - cue.start_ms) / 1000).toFixed(1);
+      const cps = computeCps(cue);
+      const longWarn = isCueLongWarning(cue);
+      const hasTgt = Boolean((cue.target_text || "").trim());
+
+      // Column 1: Meta
+      const metaCol = document.createElement("div");
+      metaCol.className = "cue-meta";
+      metaCol.innerHTML = `
+        <div class="cue-id-line">
+          <span class="cue-num">#${cue.id}</span>
+          <span class="badge-mini">${durSec}s</span>
+          ${cue.speaker ? `<span class="badge-mini badge-speaker">${escapeHtml(cue.speaker)}</span>` : ""}
+          ${cue.style && cue.style !== "Default" ? `<span class="badge-mini">${escapeHtml(cue.style)}</span>` : ""}
+          ${cue.is_special ? `<span class="badge-mini">特效保留</span>` : ""}
+          ${!cue.is_special && hasTgt && !longWarn ? `<span class="badge-mini badge-done">已译</span>` : ""}
+          ${longWarn ? `<span class="badge-mini badge-cps-warn" title="每秒约 ${cps.toFixed(1)} 字，建议点击 ✨ 精简缩字">${cps.toFixed(0)}字/s</span>` : ""}
+        </div>
+        <div class="cue-times">
+          <input class="time-input" data-time-field="start_ms" value="${msToDisplay(cue.start_ms)}" title="起始时间 (点击微调)" />
+          <input class="time-input" data-time-field="end_ms" value="${msToDisplay(cue.end_ms)}" title="结束时间 (点击微调)" />
+        </div>
+      `;
+
+      // Column 2: Source
+      const srcCol = document.createElement("div");
+      srcCol.className = "cue-source-box";
+      srcCol.title = "点击定位预览；双击可微调原文";
+      if (cue.ass_tags) {
+        const tagChip = document.createElement("div");
+        tagChip.className = "ass-tag-chip";
+        tagChip.textContent = cue.ass_tags;
+        srcCol.appendChild(tagChip);
+      }
+      const srcSpan = document.createElement("div");
+      srcSpan.textContent = cue.source_text;
+      srcCol.appendChild(srcSpan);
+
+      srcCol.addEventListener("click", () => activateCue(cue.id, true));
+      srcCol.addEventListener("dblclick", () => {
+        const edited = window.prompt(`编辑 #${cue.id} 原文：`, cue.source_text);
+        if (edited !== null && edited !== cue.source_text) {
+          pushUndoSnapshot();
+          cue.source_text = edited;
+          renderAll();
+          scheduleAutoSave();
+        }
+      });
+
+      // Column 3: Target Editor + AI Suggestions
+      const tgtWrap = document.createElement("div");
+      tgtWrap.className = "cue-target-wrap";
+
+      const textarea = document.createElement("textarea");
+      textarea.className = "cue-target-input";
+      textarea.rows = 1;
+      textarea.disabled = cue.is_special;
+      textarea.placeholder = cue.is_special ? "（ASS 注释/特效绘图行，导出自动原样保留）" : "输入或精修译文… (Tab 跳至下一行)";
+      textarea.value = cue.target_text || "";
+      textarea.dataset.cueInput = cue.id;
+
+      textarea.addEventListener("focus", () => activateCue(cue.id, false));
+      textarea.addEventListener("input", () => {
+        autoResizeTextarea(textarea);
+        cue.target_text = textarea.value;
+        cue.status = textarea.value.trim() ? "edited" : "untranslated";
+        updateStageOverlayForCue(cue);
+        updateCounts();
+        scheduleAutoSave();
+      });
+      textarea.addEventListener("keydown", (e) => {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          const allInputs = Array.from(document.querySelectorAll(".cue-target-input:not(:disabled)"));
+          const idx = allInputs.indexOf(textarea);
+          const nextIdx = e.shiftKey ? idx - 1 : idx + 1;
+          if (allInputs[nextIdx]) {
+            allInputs[nextIdx].focus();
+          }
+        }
+      });
+
+      tgtWrap.appendChild(textarea);
+
+      // Render AI single-cue suggestions if present
+      const sug = state.cueSuggestions[cue.id];
+      if (sug) {
+        const sugBox = document.createElement("div");
+        sugBox.className = "ai-suggestions";
+        const allOptions = [sug.best, ...(sug.alternatives || [])].filter(Boolean);
+        sugBox.innerHTML = `
+          <div class="ai-sug-reason">✨ ${escapeHtml(sug.reason || "AI 候选方案（点击即可采纳）：")}</div>
+          <div class="ai-sug-chips"></div>
+        `;
+        const chipsWrap = sugBox.querySelector(".ai-sug-chips");
+        allOptions.forEach((optText, i) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "sug-chip";
+          chip.textContent = `${i === 0 ? "★ 推荐：" : "备选："}${optText}`;
+          chip.addEventListener("click", () => {
+            pushUndoSnapshot();
+            cue.target_text = optText;
+            cue.status = "polished";
+            delete state.cueSuggestions[cue.id];
+            renderCueList();
+            updateCounts();
+            updateStageOverlayForCue(cue);
+            scheduleAutoSave();
+          });
+          chipsWrap.appendChild(chip);
+        });
+        tgtWrap.appendChild(sugBox);
+      }
+
+      // Column 4: Row Actions
+      const actCol = document.createElement("div");
+      actCol.className = "cue-actions";
+      actCol.innerHTML = `
+        <button class="btn btn-icon btn-sm" data-act="play" type="button" title="定位并预览此句">▶</button>
+        <button class="btn btn-icon btn-sm" data-act="ai" type="button" ${cue.is_special ? "disabled" : ""} title="AI 单句精修 / 重翻 / 缩字">✨</button>
+        <button class="btn btn-icon btn-sm" data-act="more" type="button" title="插入 / 合并 / 删除行">⋯</button>
+      `;
+
+      actCol.querySelector('[data-act="play"]').addEventListener("click", () => {
+        activateCue(cue.id, true);
+      });
+      actCol.querySelector('[data-act="ai"]').addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleAiRowPopover(cue, actCol);
+      });
+      actCol.querySelector('[data-act="more"]').addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleRowManagePopover(cue, actCol);
+      });
+
+      // Bind timestamp inline edits
+      metaCol.querySelectorAll(".time-input").forEach((inp) => {
+        inp.addEventListener("change", () => {
+          const field = inp.dataset.timeField;
+          const parsedMs = parseDisplayToMs(inp.value);
+          if (parsedMs === null) {
+            inp.value = msToDisplay(cue[field]);
+            toast("时间格式应为 HH:MM:SS.mmm", "error");
+            return;
+          }
+          pushUndoSnapshot();
+          cue[field] = parsedMs;
+          if (cue.end_ms <= cue.start_ms) cue.end_ms = cue.start_ms + 300;
+          renderCueList();
+          scheduleAutoSave();
+        });
+      });
+
+      row.appendChild(metaCol);
+      row.appendChild(srcCol);
+      row.appendChild(tgtWrap);
+      row.appendChild(actCol);
+      frag.appendChild(row);
+
+      requestAnimationFrame(() => autoResizeTextarea(textarea));
+    });
+
+    container.appendChild(frag);
+  }
+
+  function closeAllPopovers() {
+    document.querySelectorAll(".row-popover").forEach((el) => el.remove());
+  }
+
+  function toggleAiRowPopover(cue, container) {
+    const existing = container.querySelector(".row-popover");
+    closeAllPopovers();
+    if (existing) return;
+
+    const pop = document.createElement("div");
+    pop.className = "row-popover";
+    const actions = [
+      { key: "retranslate", label: "🔄 结合上下文重新精翻" },
+      { key: "natural", label: "💬 润色得更地道口语化" },
+      { key: "shorten", label: "✂️ 精简压缩字数 (降语速)" },
+      { key: "formal", label: "👔 调整为书面专业表达" },
+      { key: "custom", label: "✍️ 输入自定义修改指令…" },
+    ];
+    actions.forEach((a) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "pop-btn";
+      b.textContent = a.label;
+      b.addEventListener("click", async () => {
+        closeAllPopovers();
+        let customInst = "";
+        if (a.key === "custom") {
+          customInst = window.prompt("请输入对该句译文的修改要求（例如：改成敬语 / 保留英文缩写）：", "") || "";
+          if (!customInst.trim()) return;
+        }
+        await runSingleCueRewrite(cue, a.key, customInst);
+      });
+      pop.appendChild(b);
+    });
+    container.appendChild(pop);
+  }
+
+  function toggleRowManagePopover(cue, container) {
+    const existing = container.querySelector(".row-popover");
+    closeAllPopovers();
+    if (existing) return;
+
+    const pop = document.createElement("div");
+    pop.className = "row-popover";
+    const items = [
+      {
+        label: "➕ 在下方插入新字幕行",
+        fn: () => {
+          pushUndoSnapshot();
+          const idx = state.doc.cues.findIndex((c) => c.id === cue.id);
+          const newStart = cue.end_ms + 100;
+          const newCue = {
+            id: 0,
+            start_ms: newStart,
+            end_ms: newStart + 2200,
+            source_text: "New subtitle line",
+            target_text: "",
+            speaker: cue.speaker || "",
+            style: cue.style || "Default",
+            ass_tags: "",
+            raw_event_meta: {},
+            is_special: false,
+            status: "untranslated",
+            note: "",
+          };
+          state.doc.cues.splice(idx + 1, 0, newCue);
+          reindexCues();
+          renderAll();
+          scheduleAutoSave();
+        },
+      },
+      {
+        label: "🔗 与下一条字幕合并",
+        fn: () => {
+          const idx = state.doc.cues.findIndex((c) => c.id === cue.id);
+          const next = state.doc.cues[idx + 1];
+          if (!next) {
+            toast("已经是最后一条字幕。", "info");
+            return;
+          }
+          pushUndoSnapshot();
+          cue.end_ms = Math.max(cue.end_ms, next.end_ms);
+          cue.source_text = [cue.source_text, next.source_text].filter(Boolean).join("\n");
+          cue.target_text = [cue.target_text, next.target_text].filter(Boolean).join("\n");
+          state.doc.cues.splice(idx + 1, 1);
+          reindexCues();
+          renderAll();
+          scheduleAutoSave();
+        },
+      },
+      {
+        label: "🗑 删除此条字幕",
+        fn: () => {
+          if (state.doc.cues.length <= 1) {
+            toast("至少需保留一条字幕。", "error");
+            return;
+          }
+          pushUndoSnapshot();
+          state.doc.cues = state.doc.cues.filter((c) => c.id !== cue.id);
+          reindexCues();
+          renderAll();
+          scheduleAutoSave();
+        },
+      },
+    ];
+    items.forEach((it) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "pop-btn";
+      b.textContent = it.label;
+      b.addEventListener("click", () => {
+        closeAllPopovers();
+        it.fn();
+      });
+      pop.appendChild(b);
+    });
+    container.appendChild(pop);
+  }
+
+  function reindexCues() {
+    state.doc.cues.forEach((c, i) => {
+      c.id = i + 1;
+    });
+  }
+
+  // Activate Cue & Sync Cinema Stage
+  function activateCue(cueId, seekMedia = false) {
+    state.activeCueId = cueId;
+    document.querySelectorAll(".cue-row").forEach((r) => {
+      r.classList.toggle("active", Number(r.dataset.cueId) === cueId);
+    });
+    const cue = state.doc?.cues.find((c) => c.id === cueId);
+    if (!cue) return;
+
+    updateStageOverlayForCue(cue);
+    if (seekMedia) {
+      if (state.hasMediaFile) {
+        const video = $("media-player");
+        video.currentTime = cue.start_ms / 1000;
+      } else {
+        state.simTimeMs = cue.start_ms;
+        updatePlayerControlsUI(cue.start_ms);
+      }
+    }
+  }
+
+  function updateStageOverlayForCue(cue) {
+    const pEl = $("overlay-primary");
+    const sEl = $("overlay-secondary");
+    if (!cue || cue.is_special) {
+      pEl.textContent = "";
+      sEl.textContent = "";
+      return;
+    }
+    const src = (cue.source_text || "").trim();
+    const tgt = (cue.target_text || "").trim();
+
+    if (state.previewSubview === "source") {
+      pEl.textContent = src;
+      sEl.textContent = "";
+    } else if (state.previewSubview === "target") {
+      pEl.textContent = tgt || src;
+      sEl.textContent = "";
+    } else {
+      // bilingual
+      if (tgt) {
+        pEl.textContent = tgt;
+        sEl.textContent = src;
+      } else {
+        pEl.textContent = src;
+        sEl.textContent = "（待翻译）";
+      }
+    }
+    $("player-timecode").textContent = msToDisplay(cue.start_ms);
+  }
+
+  function getMaxDurationMs() {
+    if (state.hasMediaFile) {
+      const video = $("media-player");
+      if (video.duration && Number.isFinite(video.duration)) {
+        return video.duration * 1000;
+      }
+    }
+    const cues = state.doc?.cues || [];
+    return cues.length ? Math.max(...cues.map((c) => c.end_ms)) : 10000;
+  }
+
+  function updatePlayerControlsUI(currentMs) {
+    $("player-timecode").textContent = msToDisplay(currentMs);
+    const maxMs = Math.max(1, getMaxDurationMs());
+    $("player-scrubber").value = Math.min(1000, Math.round((currentMs / maxMs) * 1000));
+
+    if (!state.doc) return;
+    const hit = state.doc.cues.find((c) => !c.is_special && currentMs >= c.start_ms && currentMs <= c.end_ms);
+    if (hit) {
+      if (state.activeCueId !== hit.id) {
+        state.activeCueId = hit.id;
+        document.querySelectorAll(".cue-row").forEach((r) => {
+          const match = Number(r.dataset.cueId) === hit.id;
+          r.classList.toggle("active", match);
+          if (match) r.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        });
+      }
+      updateStageOverlayForCue(hit);
+    } else {
+      $("overlay-primary").textContent = "";
+      $("overlay-secondary").textContent = "";
+    }
+  }
+
+  function togglePlayback() {
+    if (state.hasMediaFile) {
+      const video = $("media-player");
+      if (video.paused) {
+        video.play();
+        $("play-icon").textContent = "⏸";
+      } else {
+        video.pause();
+        $("play-icon").textContent = "▶";
+      }
+      return;
+    }
+    if (!state.doc) return;
+    if (state.simPlaying) {
+      stopSimPlayback();
+    } else {
+      const maxMs = getMaxDurationMs();
+      if (state.simTimeMs >= maxMs) state.simTimeMs = 0;
+      state.simPlaying = true;
+      state.simLastTick = performance.now();
+      $("play-icon").textContent = "⏸";
+      const step = (now) => {
+        if (!state.simPlaying) return;
+        const dt = now - state.simLastTick;
+        state.simLastTick = now;
+        state.simTimeMs += dt;
+        if (state.simTimeMs >= getMaxDurationMs()) {
+          state.simTimeMs = getMaxDurationMs();
+          updatePlayerControlsUI(state.simTimeMs);
+          stopSimPlayback();
+          return;
+        }
+        updatePlayerControlsUI(state.simTimeMs);
+        state.simRaf = requestAnimationFrame(step);
+      };
+      state.simRaf = requestAnimationFrame(step);
+    }
+  }
+
+  function stopSimPlayback() {
+    state.simPlaying = false;
+    if (state.simRaf) cancelAnimationFrame(state.simRaf);
+    $("play-icon").textContent = "▶";
+  }
+
+  // AI Batch Stream Translation
+  async function startStreamTranslation(onlyUntranslated = false) {
+    if (!state.doc || state.translating) return;
+
+    const targetCues = state.doc.cues.filter(
+      (c) => !c.is_special && c.source_text.trim() && (!onlyUntranslated || !(c.target_text || "").trim())
+    );
+    if (!targetCues.length) {
+      toast("所有条目均已有译文！如需重翻请点击「AI 全文精翻」。", "info");
+      return;
+    }
+
+    pushUndoSnapshot();
+    syncDocContextFields();
+
+    state.translating = true;
+    state.abortController = new AbortController();
+    $("btn-translate-all").hidden = true;
+    $("btn-translate-untranslated").disabled = true;
+    $("btn-stop-translate").hidden = false;
+    $("progress-banner").hidden = false;
+    $("progress-fill").style.width = "2%";
+    $("progress-title").textContent = "正在连接 AI 引擎启动上下文精翻…";
+    $("progress-reflection").textContent = "";
+    $("progress-nums").textContent = `0 / ${targetCues.length}`;
+
+    try {
+      const resp = await fetch("/api/ai/translate-stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: state.abortController.signal,
+        body: JSON.stringify({
+          cues: state.doc.cues,
+          cue_ids: onlyUntranslated ? targetCues.map((c) => c.id) : null,
+          source_language: state.doc.source_language,
+          target_language: state.doc.target_language,
+          mode: $("select-trans-mode").value,
+          genre: state.doc.genre,
+          scene_summary: state.doc.scene_summary,
+          custom_prompt: state.doc.custom_prompt,
+          glossary: state.doc.glossary,
+        }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || "翻译请求失败");
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const chunk of parts) {
+          const line = chunk.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = JSON.parse(line.slice(5).trim());
+          handleStreamEvent(payload);
+        }
+      }
+    } catch (err) {
+      if (err.name === "AbortError") {
+        toast("已停止后续翻译，已完成批次的译文已安全保留。", "info");
+      } else {
+        toast(err.message || "翻译出错", "error");
+        if ((err.message || "").includes("API Key")) {
+          openModal("modal-settings");
+        }
+      }
+    } finally {
+      state.translating = false;
+      state.abortController = null;
+      $("btn-translate-all").hidden = false;
+      $("btn-translate-untranslated").disabled = false;
+      $("btn-stop-translate").hidden = true;
+      setTimeout(() => {
+        if (!state.translating) $("progress-banner").hidden = true;
+      }, 1600);
+      renderAll();
+      scheduleAutoSave();
+    }
+  }
+
+  function handleStreamEvent(evt) {
+    if (evt.event === "start") {
+      $("progress-title").textContent = `正在使用 ${evt.model} 进行${evt.mode === "reflective" ? "反思精翻" : "极速上下文翻译"}…`;
+    } else if (evt.event === "batch_start") {
+      $("progress-title").textContent = `正在精翻第 ${evt.batch_index}/${evt.total_batches} 批（#${evt.from_id} ~ #${evt.to_id}）…`;
+    } else if (evt.event === "batch_done") {
+      const cueById = new Map(state.doc.cues.map((c) => [c.id, c]));
+      for (const upd of evt.updates || []) {
+        const target = cueById.get(upd.id);
+        if (target && upd.target_text) {
+          target.target_text = upd.target_text;
+          target.status = upd.status;
+          const domInput = document.querySelector(`.cue-target-input[data-cue-input="${upd.id}"]`);
+          if (domInput) {
+            domInput.value = upd.target_text;
+            autoResizeTextarea(domInput);
+          }
+        }
+      }
+      $("progress-nums").textContent = `${evt.completed} / ${evt.total}`;
+      $("progress-fill").style.width = `${evt.percent || 0}%`;
+      if (evt.reflection) {
+        $("progress-reflection").textContent = `审校笔记：${evt.reflection}`;
+      }
+      updateCounts();
+    } else if (evt.event === "complete") {
+      $("progress-fill").style.width = "100%";
+      $("progress-title").textContent = "✅ 全文精翻完成！";
+      toast(evt.message || "翻译完成", "success");
+    } else if (evt.event === "error") {
+      throw new Error(evt.message || "翻译发生错误");
+    }
+  }
+
+  async function runSingleCueRewrite(cue, action, instruction = "") {
+    syncDocContextFields();
+    toast(`正在调用 AI 精修第 #${cue.id} 条字幕…`, "info");
+    try {
+      const resp = await fetch("/api/ai/rewrite-cue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cue_id: cue.id,
+          cues: state.doc.cues,
+          source_language: state.doc.source_language,
+          target_language: state.doc.target_language,
+          action,
+          instruction,
+          scene_summary: state.doc.scene_summary,
+          glossary: state.doc.glossary,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "单句润色失败");
+
+      pushUndoSnapshot();
+      cue.target_text = data.best;
+      cue.status = "polished";
+      state.cueSuggestions[cue.id] = {
+        best: data.best,
+        alternatives: data.alternatives || [],
+        reason: data.reason || "",
+      };
+      renderCueList();
+      updateCounts();
+      updateStageOverlayForCue(cue);
+      scheduleAutoSave();
+      toast(`#${cue.id} 已生成精修方案与备选表达`, "success");
+    } catch (err) {
+      toast(err.message, "error");
+      if ((err.message || "").includes("API Key")) openModal("modal-settings");
+    }
+  }
+
+  async function runExtractGlossary() {
+    if (!state.doc) return;
+    const btn = $("btn-extract-glossary");
+    const origText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "⏳ 正在扫描全片提取术语与背景…";
+    try {
+      const resp = await fetch("/api/ai/extract-glossary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cues: state.doc.cues,
+          source_language: state.doc.source_language,
+          target_language: state.doc.target_language,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "术语提取失败");
+
+      pushUndoSnapshot();
+      if (data.scene_summary) {
+        state.doc.scene_summary = data.scene_summary;
+        $("scene-summary-input").value = data.scene_summary;
+      }
+      if (data.genre) {
+        state.doc.genre = data.genre;
+        $("select-genre").value = data.genre;
+      }
+      const existingSet = new Set(state.doc.glossary.map((g) => g.source.toLowerCase()));
+      let added = 0;
+      for (const item of data.glossary || []) {
+        if (!existingSet.has(item.source.toLowerCase())) {
+          state.doc.glossary.push(item);
+          existingSet.add(item.source.toLowerCase());
+          added++;
+        }
+      }
+      renderGlossary();
+      scheduleAutoSave();
+      toast(`成功提取背景摘要及 ${added} 条关键术语！`, "success");
+    } catch (err) {
+      toast(err.message, "error");
+      if ((err.message || "").includes("API Key")) openModal("modal-settings");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  }
+
+  function syncDocContextFields() {
+    if (!state.doc) return;
+    state.doc.source_language = $("select-source-lang").value;
+    state.doc.target_language = $("select-target-lang").value;
+    state.doc.genre = $("select-genre").value;
+    state.doc.scene_summary = $("scene-summary-input").value.trim();
+    state.doc.custom_prompt = $("custom-prompt-input").value.trim();
+  }
+
+  // Modals
+  function openModal(id) {
+    if (id === "modal-settings" && state.settings) {
+      selectProviderPreset(state.settings.provider_id || "deepseek", false);
+      $("cfg-base-url").value = state.settings.base_url || "";
+      $("cfg-model").value = state.settings.model || "";
+      $("cfg-api-key").value = "";
+      $("cfg-key-saved-badge").hidden = !state.settings.has_api_key;
+      $("cfg-key-saved-badge").textContent = state.settings.has_api_key
+        ? `已保存 (${state.settings.masked_api_key})`
+        : "";
+      $("cfg-batch-size").value = state.settings.batch_size || 12;
+      $("cfg-context-win").value = state.settings.context_window || 4;
+      $("cfg-concurrency").value = state.settings.concurrency || 2;
+      $("cfg-test-result").hidden = true;
+    }
+    if (id === "modal-export") {
+      $("export-result-box").hidden = true;
+    }
+    $(id).hidden = false;
+  }
+
+  function closeModal(id) {
+    $(id).hidden = true;
+  }
+
+  function collectSettingsForm() {
+    const payload = {
+      provider_id: gridCurrentProvider,
+      base_url: $("cfg-base-url").value.trim(),
+      model: $("cfg-model").value.trim(),
+      batch_size: parseInt($("cfg-batch-size").value, 10) || 12,
+      context_window: parseInt($("cfg-context-win").value, 10) || 4,
+      concurrency: parseInt($("cfg-concurrency").value, 10) || 2,
+      default_mode: $("select-trans-mode").value,
+      default_target_lang: $("select-target-lang").value,
+    };
+    const keyVal = $("cfg-api-key").value.trim();
+    if (keyVal) payload.api_key = keyVal;
+    return payload;
+  }
+
+  // Bind UI Events
+  function bindEvents() {
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".cue-actions")) closeAllPopovers();
+      if (!e.target.closest("#sample-dropdown")) $("sample-menu").hidden = true;
+    });
+
+    $("btn-samples").addEventListener("click", (e) => {
+      e.stopPropagation();
+      $("sample-menu").hidden = !$("sample-menu").hidden;
+    });
+
+    $("subtitle-file-input").addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (file) uploadSubtitleFile(file);
+      e.target.value = "";
+    });
+
+    $("media-file-input").addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (file) mountMediaFile(file);
+      e.target.value = "";
+    });
+
+    // Drag & drop anywhere
+    let dragDepth = 0;
+    window.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      dragDepth++;
+      $("drop-overlay").hidden = false;
+    });
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("dragleave", () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) $("drop-overlay").hidden = true;
+    });
+    window.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      $("drop-overlay").hidden = true;
+      const files = Array.from(e.dataTransfer?.files || []);
+      for (const f of files) {
+        const ext = f.name.split(".").pop().toLowerCase();
+        if (["srt", "ass", "ssa", "vtt"].includes(ext)) {
+          uploadSubtitleFile(f);
+        } else if (f.type.startsWith("video/") || f.type.startsWith("audio/") || ["mp4", "mkv", "mov", "webm", "mp3", "wav", "m4a"].includes(ext)) {
+          mountMediaFile(f);
+        } else {
+          toast(`不支持的文件类型：${f.name}`, "error");
+        }
+      }
+    });
+
+    // Theme & Sidebar toggles
+    $("btn-theme-toggle").addEventListener("click", () => {
+      const cur = document.documentElement.getAttribute("data-theme");
+      const next = cur === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      localStorage.setItem("listento_theme", next);
+    });
+
+    $("btn-toggle-sidebar").addEventListener("click", () => {
+      $("sidebar").classList.toggle("collapsed");
+    });
+
+    // Undo / Redo + Shortcuts
+    $("btn-undo").addEventListener("click", undo);
+    $("btn-redo").addEventListener("click", redo);
+
+    window.addEventListener("keydown", (e) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        if (document.activeElement?.tagName === "TEXTAREA" || document.activeElement?.tagName === "INPUT") {
+          return;
+        }
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && e.key.toLowerCase() === "f" && state.doc) {
+        e.preventDefault();
+        $("search-bar").hidden = false;
+        $("search-input").focus();
+      } else if (e.ctrlKey && e.code === "Space") {
+        e.preventDefault();
+        togglePlayback();
+      }
+    });
+
+    // Player controls
+    $("btn-play-toggle").addEventListener("click", togglePlayback);
+    $("media-player").addEventListener("timeupdate", () => {
+      if (state.hasMediaFile) {
+        updatePlayerControlsUI($("media-player").currentTime * 1000);
+      }
+    });
+    $("media-player").addEventListener("ended", () => {
+      $("play-icon").textContent = "▶";
+    });
+    $("player-scrubber").addEventListener("input", (e) => {
+      const ratio = Number(e.target.value) / 1000;
+      const targetMs = ratio * getMaxDurationMs();
+      if (state.hasMediaFile) {
+        $("media-player").currentTime = targetMs / 1000;
+      } else {
+        state.simTimeMs = targetMs;
+        updatePlayerControlsUI(targetMs);
+      }
+    });
+
+    document.querySelectorAll("[data-subview]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.previewSubview = btn.dataset.subview;
+        document.querySelectorAll("[data-subview]").forEach((b) => b.classList.toggle("active", b === btn));
+        const cue = state.doc?.cues.find((c) => c.id === state.activeCueId);
+        if (cue) updateStageOverlayForCue(cue);
+      });
+    });
+
+    // Sidebar Tabs
+    document.querySelectorAll(".panel-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const target = tab.dataset.tab;
+        document.querySelectorAll(".panel-tab").forEach((t) => t.classList.toggle("active", t === tab));
+        $("tab-glossary").hidden = target !== "glossary";
+        $("tab-context").hidden = target !== "context";
+      });
+    });
+
+    // Glossary handlers
+    $("btn-add-glossary").addEventListener("click", () => {
+      if (!state.doc) {
+        toast("请先载入一份字幕文件。", "info");
+        return;
+      }
+      const src = $("glossary-src-input").value.trim();
+      const tgt = $("glossary-tgt-input").value.trim();
+      if (!src || !tgt) return;
+      pushUndoSnapshot();
+      state.doc.glossary.push({ source: src, target: tgt, note: "", enabled: true });
+      $("glossary-src-input").value = "";
+      $("glossary-tgt-input").value = "";
+      renderGlossary();
+      scheduleAutoSave();
+    });
+
+    $("glossary-list").addEventListener("click", (e) => {
+      const delIdx = e.target.dataset?.gDel;
+      if (delIdx !== undefined) {
+        pushUndoSnapshot();
+        state.doc.glossary.splice(Number(delIdx), 1);
+        renderGlossary();
+        scheduleAutoSave();
+      }
+    });
+
+    $("glossary-list").addEventListener("change", (e) => {
+      const togIdx = e.target.dataset?.gToggle;
+      if (togIdx !== undefined) {
+        state.doc.glossary[Number(togIdx)].enabled = e.target.checked;
+        scheduleAutoSave();
+      }
+    });
+
+    $("btn-extract-glossary").addEventListener("click", runExtractGlossary);
+
+    // Language & Context changes
+    ["select-source-lang", "select-target-lang", "select-genre", "scene-summary-input", "custom-prompt-input"].forEach((id) => {
+      $(id).addEventListener("change", () => {
+        syncDocContextFields();
+        scheduleAutoSave();
+      });
+    });
+
+    // Filter pills
+    document.querySelectorAll("#filter-pills .pill").forEach((pill) => {
+      pill.addEventListener("click", () => {
+        state.filter = pill.dataset.filter;
+        document.querySelectorAll("#filter-pills .pill").forEach((p) => p.classList.toggle("active", p === pill));
+        renderCueList();
+      });
+    });
+
+    // Search & Replace
+    $("btn-toggle-search").addEventListener("click", () => {
+      const bar = $("search-bar");
+      bar.hidden = !bar.hidden;
+      if (!bar.hidden) $("search-input").focus();
+      else {
+        state.searchQuery = "";
+        $("search-input").value = "";
+        renderCueList();
+      }
+    });
+    $("btn-close-search").addEventListener("click", () => {
+      $("search-bar").hidden = true;
+      state.searchQuery = "";
+      $("search-input").value = "";
+      renderCueList();
+    });
+    $("search-input").addEventListener("input", (e) => {
+      state.searchQuery = e.target.value;
+      renderCueList();
+    });
+    $("search-scope").addEventListener("change", (e) => {
+      state.searchScope = e.target.value;
+      renderCueList();
+    });
+    $("btn-replace-all").addEventListener("click", () => {
+      const findStr = $("search-input").value;
+      const repStr = $("replace-input").value;
+      if (!findStr || !state.doc) return;
+      pushUndoSnapshot();
+      let count = 0;
+      state.doc.cues.forEach((c) => {
+        if (!c.is_special && c.target_text && c.target_text.includes(findStr)) {
+          c.target_text = c.target_text.split(findStr).join(repStr);
+          count++;
+        }
+      });
+      renderAll();
+      scheduleAutoSave();
+      toast(`已在 ${count} 条译文中完成替换`, "success");
+    });
+
+    // Time Shift
+    $("btn-time-shift").addEventListener("click", () => {
+      $("shift-bar").hidden = !$("shift-bar").hidden;
+    });
+    $("btn-close-shift").addEventListener("click", () => {
+      $("shift-bar").hidden = true;
+    });
+    $("btn-apply-shift").addEventListener("click", () => {
+      const ms = parseInt($("shift-ms-input").value, 10) || 0;
+      if (ms !== 0) applyTimeShift(ms);
+    });
+    document.querySelectorAll("[data-shift]").forEach((btn) => {
+      btn.addEventListener("click", () => applyTimeShift(parseInt(btn.dataset.shift, 10)));
+    });
+
+    // Split Bilingual
+    $("btn-split-bilingual").addEventListener("click", async () => {
+      if (!state.doc) return;
+      try {
+        const resp = await fetch("/api/subtitles/split-bilingual", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state.doc.cues),
+        });
+        const data = await resp.json();
+        if (!data.split_count) {
+          toast("未检测到可拆分的双行未译字幕。", "info");
+          return;
+        }
+        pushUndoSnapshot();
+        state.doc.cues = data.cues;
+        renderAll();
+        scheduleAutoSave();
+        toast(`已将 ${data.split_count} 条双语字幕拆分为原文轨 + 译文轨！`, "success");
+      } catch (err) {
+        toast("双语分轨失败", "error");
+      }
+    });
+
+    // AI Translation buttons
+    $("btn-translate-all").addEventListener("click", () => startStreamTranslation(false));
+    $("btn-translate-untranslated").addEventListener("click", () => startStreamTranslation(true));
+    $("btn-stop-translate").addEventListener("click", () => {
+      if (state.abortController) state.abortController.abort();
+    });
+
+    // Settings Modal
+    $("btn-open-settings").addEventListener("click", () => openModal("modal-settings"));
+    $("btn-open-export").addEventListener("click", () => openModal("modal-export"));
+
+    document.querySelectorAll("[data-close-modal]").forEach((btn) => {
+      btn.addEventListener("click", () => closeModal(btn.dataset.closeModal));
+    });
+
+    $("btn-test-api").addEventListener("click", async () => {
+      const box = $("cfg-test-result");
+      box.hidden = false;
+      box.className = "test-result-box";
+      box.textContent = "⏳ 正在测试 API 连通性与响应延迟…";
+      try {
+        const resp = await fetch("/api/settings/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collectSettingsForm()),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "连接失败");
+        box.className = "test-result-box ok";
+        box.textContent = `✅ 连接成功！模型 ${data.model} 响应正常，往返延迟 ${data.latency_ms} ms`;
+      } catch (err) {
+        box.className = "test-result-box err";
+        box.textContent = `❌ ${err.message}`;
+      }
+    });
+
+    $("btn-save-settings").addEventListener("click", async () => {
+      try {
+        const resp = await fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collectSettingsForm()),
+        });
+        const saved = await resp.json();
+        if (!resp.ok) throw new Error(saved.detail || "保存失败");
+        state.settings = saved;
+        refreshApiStatusUI();
+        closeModal("modal-settings");
+        toast("AI 引擎设置已持久化保存", "success");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    });
+
+    // Export Modal
+    document.querySelectorAll("#export-track-cards .radio-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        document.querySelectorAll("#export-track-cards .radio-card").forEach((c) => c.classList.remove("selected"));
+        card.classList.add("selected");
+        card.querySelector("input").checked = true;
+      });
+    });
+
+    $("export-ass-scale").addEventListener("input", (e) => {
+      $("ass-scale-val").textContent = `${e.target.value}%`;
+    });
+
+    $("btn-confirm-export").addEventListener("click", async () => {
+      if (!state.doc) return;
+      syncDocContextFields();
+      const formats = Array.from(document.querySelectorAll(".format-checks input:checked")).map((el) => el.value);
+      if (!formats.length) {
+        toast("请至少勾选一种导出格式。", "error");
+        return;
+      }
+      const trackMode = document.querySelector('input[name="track_mode"]:checked')?.value || "bilingual_tgt_top";
+      const scale = parseInt($("export-ass-scale").value, 10) || 72;
+
+      try {
+        const resp = await fetch("/api/subtitles/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            document: state.doc,
+            formats,
+            track_mode: trackMode,
+            ass_secondary_scale: scale,
+            fallback_to_source: true,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "导出失败");
+
+        for (const f of data.files) {
+          triggerDownload(f.filename, f.content);
+        }
+        const box = $("export-result-box");
+        box.hidden = false;
+        box.innerHTML = `✅ 已生成并下载 <strong>${data.files.map((x) => escapeHtml(x.filename)).join(", ")}</strong><br><small>同时已备份至本地目录：<code>${escapeHtml(data.exports_dir)}</code></small>`;
+        toast(`成功导出 ${data.files.length} 个字幕文件`, "success");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    });
+  }
+
+  async function applyTimeShift(offsetMs) {
+    if (!state.doc) return;
+    try {
+      const resp = await fetch("/api/subtitles/shift", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cues: state.doc.cues, offset_ms: offsetMs }),
+      });
+      const data = await resp.json();
+      pushUndoSnapshot();
+      state.doc.cues = data.cues;
+      renderCueList();
+      scheduleAutoSave();
+      toast(`时间轴已整体平移 ${offsetMs > 0 ? "+" : ""}${offsetMs} ms`, "success");
+    } catch (_) {
+      toast("时间轴平移失败", "error");
+    }
+  }
+
+  function triggerDownload(filename, content) {
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(url);
+    }, 300);
+  }
+
+  function escapeHtml(str) {
+    return String(str ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  init();
+})();

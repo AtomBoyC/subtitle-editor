@@ -1,0 +1,19 @@
+1
+00:00:01,123 --> 00:00:03,456
+Hello, welcome to our subtitle editor.
+你好 欢迎收看我们的字幕编辑
+
+2
+00:00:04,000 --> 00:00:07,200
+The meeting starts at nine tomorrow morning. Please bring your notebook.
+会议明天早上九点开始 请带上你的笔记本电脑或本子
+
+3
+00:00:07,600 --> 00:00:11,000
+Honestly, this rough draft still reads like a machine translated it word by word.
+老实说这个粗糙的草稿仍然读起来像一台机器逐字翻译了它
+
+4
+00:00:11,300 --> 00:00:14,800
+Let's polish these lines right here before sending the final cut to the client!
+让我们在把最终剪辑发送给客户之前就在这里抛光这些线条！

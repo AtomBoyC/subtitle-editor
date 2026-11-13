@@ -1,0 +1,30 @@
+1
+00:00:01,120 --> 00:00:03,850
+<i>Hello everyone, welcome to ListenTo Studio.</i>
+
+2
+00:00:04,100 --> 00:00:07,200
+For years, translating subtitles with offline word-by-word models
+was a frustrating experience.
+
+3
+00:00:07,450 --> 00:00:10,600
+Whenever a single sentence was split across two timestamps,
+
+4
+00:00:10,650 --> 00:00:14,100
+traditional tools completely lost track of the grammar and speaker tone.
+
+5
+00:00:14,500 --> 00:00:18,300
+With our new context-window and reflective LLM pipeline,
+character names, technical terms like API and WebVTT,
+
+6
+00:00:18,400 --> 00:00:21,900
+stay consistent from the opening scene all the way to the credits.
+
+7
+00:00:22,300 --> 00:00:25,800
+Click any line to tweak the phrasing, preview alongside your video,
+and export cinema-ready bilingual ASS or SRT files!
