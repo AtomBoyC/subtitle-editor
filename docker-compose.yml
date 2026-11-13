@@ -1,0 +1,23 @@
+services:
+  listento-studio:
+    # 若已推送至 Docker Hub，可直接改为 image: atomboyc/listento-subtitle-editor:latest
+    image: ${DOCKERHUB_IMAGE:-atomboyc/listento-subtitle-editor:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: listento-studio
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8765}:8765"
+    environment:
+      - PORT=8765
+      # 可选：通过环境变量预注入默认 API Key（也可直接在网页右上角界面配置并持久化在 ./data）
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - SUBTITLE_API_KEY=${SUBTITLE_API_KEY:-}
+    volumes:
+      - ./data:/data
+      - ./exports:/exports
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -15,7 +15,38 @@
 
 ## 快速启动
 
-### macOS / Linux
+### 方式一：Docker / Docker Compose 一键部署（推荐服务器 / NAS / 跨平台）
+
+支持 `linux/amd64` 与 `linux/arm64`（Apple Silicon / 树莓派 / 群晖 / 飞牛 OS / Linux 云服务器）双架构镜像：
+
+**1. 使用 `docker run` 直接启动：**
+
+```bash
+docker run -d \
+  --name listento-studio \
+  -p 8765:8765 \
+  -v $(pwd)/data:/data \
+  -v $(pwd)/exports:/exports \
+  --add-host=host.docker.internal:host-gateway \
+  --restart unless-stopped \
+  atomboyc/listento-subtitle-editor:latest
+```
+
+> 也可拉取 GitHub Container Registry 镜像：`ghcr.io/atomboyc/listento-subtitle-editor:latest`
+
+**2. 使用 `docker compose` 启动：**
+
+```bash
+docker compose up -d
+```
+
+启动后浏览器访问 **`http://localhost:8765`**，API Key 与字幕项目进度会自动持久化保存在挂载的 `./data` 目录中。
+
+---
+
+### 方式二：本机源码直接运行
+
+#### macOS / Linux
 
 ```bash
 chmod +x start.sh
@@ -24,7 +55,7 @@ chmod +x start.sh
 
 启动后浏览器会自动打开 **`http://127.0.0.1:8765`**。
 
-### Windows
+#### Windows
 
 双击运行 **`Start.cmd`** 即可自动配置 `.venv` 并打开浏览器工作台。
 

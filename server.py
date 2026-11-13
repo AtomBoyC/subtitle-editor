@@ -1,6 +1,7 @@
 """FastAPI Backend Server for ListenTo Studio v2.0 (听见 · AI 字幕精修工作台)."""
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List
@@ -49,7 +50,7 @@ from core.translator import (
 
 STATIC_DIR = ROOT_DIR / "static"
 SAMPLES_DIR = ROOT_DIR / "samples"
-EXPORTS_DIR = ROOT_DIR / "exports"
+EXPORTS_DIR = Path(os.environ.get("LISTENTO_EXPORTS_DIR", str(ROOT_DIR / "exports")))
 
 BUILTIN_SAMPLES: List[Dict[str, str]] = [
     {
@@ -87,6 +88,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+async def health_check() -> Dict[str, str]:
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.get("/api/meta")

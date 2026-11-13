@@ -8,9 +8,10 @@ from typing import List, Optional
 from core.models import APISettings, APISettingsPublic, APISettingsUpdate, ProviderPreset
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / ".data"
+DATA_DIR = Path(os.environ.get("LISTENTO_DATA_DIR", str(ROOT_DIR / ".data")))
 SETTINGS_FILE = DATA_DIR / "settings.json"
 PROJECTS_DIR = DATA_DIR / "projects"
+_IN_DOCKER = os.environ.get("LISTENTO_IN_DOCKER") == "1"
 
 PROVIDER_PRESETS: List[ProviderPreset] = [
     ProviderPreset(
@@ -87,11 +88,11 @@ PROVIDER_PRESETS: List[ProviderPreset] = [
         id="ollama",
         name="Ollama (本地离线模型)",
         badge="本地免 Key",
-        base_url="http://localhost:11434/v1",
+        base_url="http://host.docker.internal:11434/v1" if _IN_DOCKER else "http://localhost:11434/v1",
         default_model="qwen2.5:7b",
         models=["qwen2.5:7b", "qwen2.5:14b", "gemma2:9b", "llama3.1:8b"],
         requires_key=False,
-        doc_hint="数据完全不出本机；建议 16GB+ 内存使用 qwen2.5:7b 或 14b。",
+        doc_hint="数据不出本机；Docker 部署下已自动指向宿主机 host.docker.internal:11434。",
     ),
     ProviderPreset(
         id="custom",

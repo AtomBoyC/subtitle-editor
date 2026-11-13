@@ -301,7 +301,12 @@
     if (!state.settings) return;
     const btn = $("btn-open-settings");
     const label = $("api-status-label");
-    const isLocal = (state.settings.base_url || "").includes("localhost") || (state.settings.base_url || "").includes("127.0.0.1");
+    const baseUrl = (state.settings.base_url || "").toLowerCase();
+    const isLocal =
+      baseUrl.includes("localhost") ||
+      baseUrl.includes("127.0.0.1") ||
+      baseUrl.includes("host.docker.internal") ||
+      baseUrl.includes("://ollama");
     const ready = state.settings.has_api_key || isLocal;
 
     btn.classList.toggle("ready", ready);

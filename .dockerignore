@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.data
+data
+exports
+__pycache__
+*.py[cod]
+.DS_Store
+tests
+start.sh
+Start.cmd
+README.md

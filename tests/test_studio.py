@@ -15,7 +15,7 @@ from core.parser import (
     shift_cues_timestamps,
     split_bilingual_cues,
 )
-from core.translator import extract_json_payload
+from core.translator import _is_local_url, extract_json_payload
 from server import app
 
 
@@ -117,6 +117,14 @@ class StudioTestSuite(unittest.TestCase):
 
         shifted = shift_cues_timestamps(split_cues, 500)
         self.assertEqual(shifted[0].start_ms, 1623)
+
+    def test_docker_health_and_host_internal_detection(self):
+        h_resp = self.client.get("/api/health")
+        self.assertEqual(h_resp.status_code, 200)
+        self.assertEqual(h_resp.json()["status"], "ok")
+        self.assertTrue(_is_local_url("http://host.docker.internal:11434/v1"))
+        self.assertTrue(_is_local_url("http://ollama:11434/v1"))
+        self.assertFalse(_is_local_url("https://api.deepseek.com/v1"))
 
     def test_json_extractor_strips_reasoning_and_fences(self):
         messy = "<think>analyzing context...</think>\nHere is JSON:\n```json\n{\"ok\": true, \"items\": [1, 2,]}\n```"

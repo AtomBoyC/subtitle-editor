@@ -50,7 +50,9 @@ class LLMTranslationError(RuntimeError):
 def _is_local_url(url: str) -> bool:
     try:
         host = (urlsplit(url).hostname or "").lower()
-        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        if not host:
+            return False
+        if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal") or "." not in host or host.endswith((".local", ".internal")):
             return True
         return ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_private
     except ValueError:
